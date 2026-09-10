@@ -69,6 +69,64 @@ void main() {
     pty.kill();
   });
 
+  test('Pty.startAsync works', () async {
+    final pty = await Pty.startAsync(shell);
+    pty.write('random input'.toUtf8());
+
+    expect(await pty.output.first, isNotEmpty);
+
+    pty.kill();
+  });
+
+  test('Pty.startAsync reports exit code of fast-exiting child', () async {
+    // Regression (new-terminal freeze): the exit listener must be armed
+    // before the off-thread spawn — a child that dies instantly posts its
+    // exit code while startAsync is still awaiting the helper isolate, and
+    // ReceivePorts drop messages with no listener attached.
+    final arguments = Platform.isWindows
+        ? const ['/c', 'exit 7']
+        : const ['-c', 'exit 7'];
+    final pty = await Pty.startAsync(shell, arguments: arguments);
+
+    expect(await pty.exitCode, 7);
+  });
+
+  test('Pty.startAsync can set working directory', () async {
+    final tempDir = await Directory.systemTemp.createTemp('flutter_pty_test');
+
+    final pty = await Pty.startAsync(shell, workingDirectory: tempDir.path);
+
+    if (Platform.isWindows) {
+      pty.write('cd$nl'.toUtf8());
+    } else {
+      pty.write('pwd$nl'.toUtf8());
+    }
+
+    final collector = OutputCollector(pty);
+    await collector.waitForOutput(tempDir.path);
+
+    pty.kill();
+  });
+
+  test('Pty.startAsync can set environment variables', () async {
+    final pty = await Pty.startAsync(
+      shell,
+      environment: {'TEST_ENV': 'test'},
+    );
+
+    if (Platform.isWindows) {
+      pty.write('echo %TEST_ENV%$nl'.toUtf8());
+    } else {
+      pty.write('echo \$TEST_ENV$nl'.toUtf8());
+    }
+
+    final collector = OutputCollector(pty);
+
+    await collector.waitForOutput('test');
+
+    pty.kill();
+  });
+
   test('Pty.kill works', () async {
     final pty = Pty.start(shell);
     pty.write('random input'.toUtf8());

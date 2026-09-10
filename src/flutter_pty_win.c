@@ -325,9 +325,38 @@ typedef struct PtyHandle
 
     HANDLE hMutex;
 
+    HANDLE hJob;
+
 } PtyHandle;
 
 char *error_message = NULL;
+
+// Kill-on-close job: when the owning app dies (force kill, crash), the OS
+// closes the job handle and terminates the PTY child. Without this, a
+// force-killed app leaks its wsl.exe children — orphans accumulate across
+// sessions and saturate process creation.
+static HANDLE create_kill_on_close_job(void)
+{
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+
+    if (job == NULL)
+    {
+        return NULL;
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
+    ZeroMemory(&info, sizeof(info));
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info,
+                                 sizeof(info)))
+    {
+        CloseHandle(job);
+        return NULL;
+    }
+
+    return job;
+}
 
 FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
 {
@@ -453,6 +482,17 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
         1,    // maximum count
         NULL);
 
+    HANDLE job = create_kill_on_close_job();
+
+    if (job != NULL)
+    {
+        if (!AssignProcessToJobObject(job, processInfo.hProcess))
+        {
+            CloseHandle(job);
+            job = NULL;
+        }
+    }
+
     start_read_thread(outputReadSide, options->stdout_port, mutex, options->ackRead);
 
     start_wait_exit_thread(processInfo.hProcess, options->exit_port, mutex);
@@ -471,6 +511,7 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
     pty->dwProcessId = processInfo.dwProcessId;
     pty->ackRead = options->ackRead;
     pty->hMutex = mutex;
+    pty->hJob = job;
 
     return pty;
 }

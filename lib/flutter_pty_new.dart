@@ -36,7 +36,8 @@ void _ensureInitialized() {
 
 /// Pty represents a process running in a pseudo-terminal.
 ///
-/// To create a Pty, use [Pty.start].
+/// To create a Pty, use [Pty.startAsync] (preferred: spawns off the calling
+/// thread) or [Pty.start] (blocking).
 class Pty {
   final String executable;
 
@@ -45,6 +46,10 @@ class Pty {
   /// Spawns a process in a pseudo-terminal. The arguments have the same meaning
   /// as in [Process.start].
   /// [ackRead] indicates if the pty should wait for a call to [Pty.ackRead] before sending the next data.
+  ///
+  /// The native `pty_create` call spawns the child process synchronously on
+  /// the calling thread. Under WSL process-creation saturation that spawn can
+  /// stall for tens of seconds, so UI threads must use [Pty.startAsync].
   Pty.start(
     this.executable, {
     this.arguments = const [],
@@ -56,74 +61,83 @@ class Pty {
   }) {
     _ensureInitialized();
 
-    final effectiveEnv = <String, String>{};
+    final result = _createPtyNative(
+      _PtySpawnRequest(
+        executable: executable,
+        arguments: arguments,
+        environment: _buildEffectiveEnvironment(environment),
+        workingDirectory: workingDirectory,
+        rows: rows,
+        columns: columns,
+        ackRead: ackRead,
+        stdoutPort: _stdoutPort.sendPort.nativePort,
+        exitPort: _exitPort.sendPort.nativePort,
+      ),
+    );
 
-    effectiveEnv['TERM'] = 'xterm-256color';
-    // Without this, tools like "vi" produce sequences that are not UTF-8 friendly
-    effectiveEnv['LANG'] = 'en_US.UTF-8';
-
-    const envValuesToCopy = {
-      'LOGNAME',
-      'USER',
-      'DISPLAY',
-      'LC_TYPE',
-      'HOME',
-      'PATH'
-    };
-
-    for (var entry in Platform.environment.entries) {
-      if (envValuesToCopy.contains(entry.key)) {
-        effectiveEnv[entry.key] = entry.value;
-      }
+    if (result.error != null) {
+      _closePorts();
+      throw StateError('Failed to create PTY: ${result.error}');
     }
-
-    if (environment != null) {
-      for (var entry in environment.entries) {
-        effectiveEnv[entry.key] = entry.value;
-      }
-    }
-
-    // build argv
-    final argv = calloc<Pointer<Utf8>>(arguments.length + 2);
-    argv.elementAt(0).value = executable.toNativeUtf8();
-    for (var i = 0; i < arguments.length; i++) {
-      argv.elementAt(i + 1).value = arguments[i].toNativeUtf8();
-    }
-    argv.elementAt(arguments.length + 1).value = nullptr;
-
-    //build env
-    final envp = calloc<Pointer<Utf8>>(effectiveEnv.length + 1);
-    for (var i = 0; i < effectiveEnv.length; i++) {
-      final entry = effectiveEnv.entries.elementAt(i);
-      envp.elementAt(i).value = '${entry.key}=${entry.value}'.toNativeUtf8();
-    }
-    envp.elementAt(effectiveEnv.length).value = nullptr;
-
-    final options = calloc<PtyOptions>();
-    options.ref.rows = rows;
-    options.ref.cols = columns;
-    options.ref.executable = executable.toNativeUtf8().cast();
-    options.ref.arguments = argv.cast();
-    options.ref.environment = envp.cast();
-    options.ref.stdout_port = _stdoutPort.sendPort.nativePort;
-    options.ref.exit_port = _exitPort.sendPort.nativePort;
-    options.ref.ackRead = ackRead;
-
-    if (workingDirectory != null) {
-      options.ref.working_directory = workingDirectory.toNativeUtf8().cast();
-    } else {
-      options.ref.working_directory = nullptr;
-    }
-
-    _handle = _bindings.pty_create(options);
-
-    calloc.free(options);
-
-    if (_handle == nullptr) {
-      throw StateError('Failed to create PTY: ${_getPtyError()}');
-    }
+    _handle = Pointer<PtyHandle>.fromAddress(result.handleAddress!);
 
     _exitPort.first.then(_onExitCode);
+  }
+
+  Pty._pending(this.executable, this.arguments);
+
+  /// Spawns a process in a pseudo-terminal without blocking the caller's
+  /// event loop: the native `pty_create` call runs in a short-lived helper
+  /// isolate.
+  ///
+  /// Identical spawn semantics to [Pty.start]. Under WSL process-creation
+  /// saturation the `CreateProcessW` inside `pty_create` can stall for tens
+  /// of seconds; running it off-thread keeps the caller responsive while the
+  /// OS is slow to start the child.
+  ///
+  /// The stdout/exit [ReceivePort]s stay on the calling isolate: native port
+  /// ids are process-global, so the native read/exit threads post their
+  /// events straight back to the caller even though the PTY was created by
+  /// the helper isolate.
+  static Future<Pty> startAsync(
+    String executable, {
+    List<String> arguments = const [],
+    String? workingDirectory,
+    Map<String, String>? environment,
+    int rows = 25,
+    int columns = 80,
+    bool ackRead = false,
+  }) async {
+    _ensureInitialized();
+    final pty = Pty._pending(executable, arguments);
+    // Listen before spawning: a fast-exiting child posts its exit code while
+    // the create FFI is still off-thread, and ReceivePorts drop messages that
+    // arrive with no listener attached.
+    final exitSubscription = pty._exitPort.listen(pty._onExitCode);
+    final request = _PtySpawnRequest(
+      executable: executable,
+      arguments: arguments,
+      environment: _buildEffectiveEnvironment(environment),
+      workingDirectory: workingDirectory,
+      rows: rows,
+      columns: columns,
+      ackRead: ackRead,
+      stdoutPort: pty._stdoutPort.sendPort.nativePort,
+      exitPort: pty._exitPort.sendPort.nativePort,
+    );
+
+    final result = await Isolate.run(
+      () => _createPtyNative(request),
+      debugName: 'pty_create',
+    );
+
+    if (result.error != null) {
+      await exitSubscription.cancel();
+      pty._closePorts();
+      throw StateError('Failed to create PTY: ${result.error}');
+    }
+    pty._handle = Pointer<PtyHandle>.fromAddress(result.handleAddress!);
+    return pty;
   }
 
   final _stdoutPort = ReceivePort();
@@ -250,10 +264,146 @@ class Pty {
   }
 
   void _onExitCode(dynamic exitCode) {
-    _stdoutPort.close();
-    _exitPort.close();
+    _closePorts();
     _exitCodeCompleter.complete(exitCode);
   }
+
+  void _closePorts() {
+    _stdoutPort.close();
+    _exitPort.close();
+  }
+}
+
+/// Plain-data spawn request handed to the helper isolate by [Pty.startAsync].
+/// Must stay sendable across isolates: strings, ints, bools only.
+class _PtySpawnRequest {
+  const _PtySpawnRequest({
+    required this.executable,
+    required this.arguments,
+    required this.environment,
+    required this.workingDirectory,
+    required this.rows,
+    required this.columns,
+    required this.ackRead,
+    required this.stdoutPort,
+    required this.exitPort,
+  });
+
+  final String executable;
+  final List<String> arguments;
+  final Map<String, String> environment;
+  final String? workingDirectory;
+  final int rows;
+  final int columns;
+  final bool ackRead;
+
+  /// Native port id of the owning isolate's stdout [ReceivePort].
+  final int stdoutPort;
+
+  /// Native port id of the owning isolate's exit [ReceivePort].
+  final int exitPort;
+}
+
+class _PtySpawnResult {
+  const _PtySpawnResult({this.handleAddress, this.error});
+
+  final int? handleAddress;
+  final String? error;
+}
+
+Map<String, String> _buildEffectiveEnvironment(
+  Map<String, String>? environment,
+) {
+  final effectiveEnv = <String, String>{};
+
+  effectiveEnv['TERM'] = 'xterm-256color';
+  // Without this, tools like "vi" produce sequences that are not UTF-8 friendly
+  effectiveEnv['LANG'] = 'en_US.UTF-8';
+
+  const envValuesToCopy = {
+    'LOGNAME',
+    'USER',
+    'DISPLAY',
+    'LC_TYPE',
+    'HOME',
+    'PATH'
+  };
+
+  for (var entry in Platform.environment.entries) {
+    if (envValuesToCopy.contains(entry.key)) {
+      effectiveEnv[entry.key] = entry.value;
+    }
+  }
+
+  if (environment != null) {
+    for (var entry in environment.entries) {
+      effectiveEnv[entry.key] = entry.value;
+    }
+  }
+
+  return effectiveEnv;
+}
+
+/// Performs the `pty_create` FFI call and returns the raw native handle
+/// address. The native side copies every string before `CreateProcessW`, so
+/// all native allocations are released here.
+///
+/// Runs on the caller's isolate for [Pty.start], or in a short-lived helper
+/// isolate for [Pty.startAsync] — the stdout/exit ports are process-global
+/// ids, so the native threads post back to whichever isolate owns them.
+_PtySpawnResult _createPtyNative(_PtySpawnRequest request) {
+  final nativeArgv = <Pointer<Utf8>>[
+    request.executable.toNativeUtf8(),
+    for (final argument in request.arguments) argument.toNativeUtf8(),
+  ];
+  final argv = calloc<Pointer<Utf8>>(nativeArgv.length + 1);
+  for (var i = 0; i < nativeArgv.length; i++) {
+    argv.elementAt(i).value = nativeArgv[i];
+  }
+  argv.elementAt(nativeArgv.length).value = nullptr;
+
+  final nativeEnv = <Pointer<Utf8>>[
+    for (final entry in request.environment.entries)
+      '${entry.key}=${entry.value}'.toNativeUtf8(),
+  ];
+  final envp = calloc<Pointer<Utf8>>(nativeEnv.length + 1);
+  for (var i = 0; i < nativeEnv.length; i++) {
+    envp.elementAt(i).value = nativeEnv[i];
+  }
+  envp.elementAt(nativeEnv.length).value = nullptr;
+
+  final workingDirectory = request.workingDirectory?.toNativeUtf8();
+
+  final options = calloc<PtyOptions>();
+  options.ref.rows = request.rows;
+  options.ref.cols = request.columns;
+  options.ref.executable = nativeArgv[0].cast();
+  options.ref.arguments = argv.cast();
+  options.ref.environment = envp.cast();
+  options.ref.stdout_port = request.stdoutPort;
+  options.ref.exit_port = request.exitPort;
+  options.ref.ackRead = request.ackRead;
+  options.ref.working_directory = workingDirectory?.cast() ?? nullptr;
+
+  final handle = _bindings.pty_create(options);
+
+  calloc.free(options);
+  calloc.free(argv);
+  calloc.free(envp);
+  for (final pointer in nativeArgv) {
+    calloc.free(pointer);
+  }
+  for (final pointer in nativeEnv) {
+    calloc.free(pointer);
+  }
+  if (workingDirectory != null) {
+    calloc.free(workingDirectory);
+  }
+
+  if (handle == nullptr) {
+    return _PtySpawnResult(error: _getPtyError() ?? 'unknown error');
+  }
+  return _PtySpawnResult(handleAddress: handle.address);
 }
 
 String? _getPtyError() {
