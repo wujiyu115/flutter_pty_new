@@ -333,7 +333,7 @@ char *error_message = NULL;
 
 // Kill-on-close job: when the owning app dies (force kill, crash), the OS
 // closes the job handle and terminates the PTY child. Without this, a
-// force-killed app leaks its wsl.exe children — orphans accumulate across
+// force-killed app leaks its wsl.exe children; orphans accumulate across
 // sessions and saturate process creation.
 static HANDLE create_kill_on_close_job(void)
 {
